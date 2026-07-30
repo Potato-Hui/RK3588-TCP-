@@ -11,7 +11,10 @@
 
 #include "coreNum.hpp"
 #include "rkYolov5s.hpp"
-
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <vector>
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
     std::string shape_str = attr->n_dims < 1 ? "" : std::to_string(attr->dims[0]);
@@ -207,7 +210,168 @@ rknn_context *rkYolov5s::get_pctx()
 {
     return &ctx;
 }
+struct yolov8_seg_candidate_t
+{
+    cv::Rect2f model_box;
+    cv::Rect original_box;
+    float confidence;
+    int class_id;
+    std::vector<float> mask_coefficients;
+};
 
+static float calculate_iou(
+    const cv::Rect2f &box_a,
+    const cv::Rect2f &box_b)
+{
+    const float left =
+        std::max(box_a.x, box_b.x);
+
+    const float top =
+        std::max(box_a.y, box_b.y);
+
+    const float right =
+        std::min(
+            box_a.x + box_a.width,
+            box_b.x + box_b.width);
+
+    const float bottom =
+        std::min(
+            box_a.y + box_a.height,
+            box_b.y + box_b.height);
+
+    const float intersection_width =
+        std::max(0.0f, right - left);
+
+    const float intersection_height =
+        std::max(0.0f, bottom - top);
+
+    const float intersection_area =
+        intersection_width * intersection_height;
+
+    const float union_area =
+        box_a.area() +
+        box_b.area() -
+        intersection_area;
+
+    if (union_area <= 0.0f)
+    {
+        return 0.0f;
+    }
+
+    return intersection_area / union_area;
+}
+
+static std::vector<int> perform_class_nms(
+    const std::vector<yolov8_seg_candidate_t> &candidates,
+    float nms_threshold)
+{
+    std::vector<int> order(candidates.size());
+
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        order[i] = static_cast<int>(i);
+    }
+
+    std::sort(
+        order.begin(),
+        order.end(),
+        [&candidates](int left, int right)
+        {
+            return candidates[left].confidence >
+                   candidates[right].confidence;
+        });
+
+    std::vector<int> keep_indices;
+    std::vector<unsigned char> removed(
+        candidates.size(),
+        0);
+
+    for (size_t i = 0; i < order.size(); ++i)
+    {
+        const int current_index = order[i];
+
+        if (removed[current_index])
+        {
+            continue;
+        }
+
+        keep_indices.push_back(current_index);
+
+        for (size_t j = i + 1;
+             j < order.size();
+             ++j)
+        {
+            const int compare_index = order[j];
+
+            if (removed[compare_index])
+            {
+                continue;
+            }
+
+            if (candidates[current_index].class_id !=
+                candidates[compare_index].class_id)
+            {
+                continue;
+            }
+
+            const float iou = calculate_iou(
+                candidates[current_index].model_box,
+                candidates[compare_index].model_box);
+
+            if (iou > nms_threshold)
+            {
+                removed[compare_index] = 1;
+            }
+        }
+    }
+
+    return keep_indices;
+}
+
+static cv::Scalar get_seg_color(int class_id)
+{
+    static const cv::Scalar colors[] =
+    {
+        cv::Scalar(0, 0, 255),
+        cv::Scalar(0, 255, 255),
+        cv::Scalar(255, 0, 255),
+        cv::Scalar(0, 255, 0),
+        cv::Scalar(255, 0, 0),
+        cv::Scalar(255, 255, 0)
+    };
+
+    const int color_count =
+        static_cast<int>(
+            sizeof(colors) / sizeof(colors[0]));
+
+    int color_index = class_id % color_count;
+
+    if (color_index < 0)
+    {
+        color_index = 0;
+    }
+
+    return colors[color_index];
+}
+
+static std::string get_defect_name(int class_id)
+{
+    // 类别顺序必须和训练数据集中的类别顺序完全一致
+    static const std::vector<std::string> class_names =
+    {
+        "broken",
+        "crack",
+        "ablation"
+    };
+
+    if (class_id >= 0 &&
+        class_id < static_cast<int>(class_names.size()))
+    {
+        return class_names[class_id];
+    }
+
+    return "class_" + std::to_string(class_id);
+}
 cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
 {
     std::lock_guard<std::mutex> lock(mtx);
@@ -292,7 +456,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         io_num.n_input,
         inputs);
 
-    if (ret < 0)
+    if (ret != RKNN_SUCC)
     {
         fprintf(stderr,
                 "rknn_inputs_set failed, ret=%d\n",
@@ -301,13 +465,24 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         return orig_img;
     }
 
-    // 当前通用后处理只支持 YOLOv8 Detect 单输出模型
-    if (io_num.n_output != 1)
+    // YOLOv8-Seg需要两个输出：检测结果和原型掩码
+    if (io_num.n_output != 2)
     {
         fprintf(stderr,
-                "Current postprocess expects 1 output, "
-                "but model has %u outputs\n",
+                "YOLOv8-Seg expects 2 outputs, but model has %u outputs\n",
                 io_num.n_output);
+
+        return orig_img;
+    }
+
+    if (output_attrs[0].n_dims != 3 ||
+        output_attrs[1].n_dims != 4)
+    {
+        fprintf(stderr,
+                "Unsupported YOLOv8-Seg output dimensions: "
+                "output0 n_dims=%u, output1 n_dims=%u\n",
+                output_attrs[0].n_dims,
+                output_attrs[1].n_dims);
 
         return orig_img;
     }
@@ -317,7 +492,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
     memset(
         outputs.data(),
         0,
-        sizeof(rknn_output) * outputs.size());
+        outputs.size() * sizeof(rknn_output));
 
     for (uint32_t i = 0;
          i < io_num.n_output;
@@ -325,14 +500,14 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
     {
         outputs[i].index = i;
 
-        // 返回模型原始输出类型，由 postprocess.cc 根据 attr->type 解析
-        outputs[i].want_float = 0;
+        // RKNN Runtime将输出统一转换为float
+        outputs[i].want_float = 1;
     }
 
     // 执行推理
     ret = rknn_run(ctx, nullptr);
 
-    if (ret < 0)
+    if (ret != RKNN_SUCC)
     {
         fprintf(stderr,
                 "rknn_run failed, ret=%d\n",
@@ -348,7 +523,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         outputs.data(),
         nullptr);
 
-    if (ret < 0)
+    if (ret != RKNN_SUCC)
     {
         fprintf(stderr,
                 "rknn_outputs_get failed, ret=%d\n",
@@ -357,30 +532,483 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         return orig_img;
     }
 
-    detect_result_group_t detect_result_group;
-    memset(
-        &detect_result_group,
-        0,
-        sizeof(detect_result_group));
+    const float *detection_output =
+        static_cast<const float *>(outputs[0].buf);
 
-    // 新版 YOLOv8 单输出后处理
-    const int post_ret = post_process(
-        outputs[0].buf,
-        &output_attrs[0],
-        height,
-        width,
-        box_conf_threshold,
-        nms_threshold,
-        pads,
-        scale_w,
-        scale_h,
-        &detect_result_group);
+    const float *prototype_output =
+        static_cast<const float *>(outputs[1].buf);
 
-    if (post_ret != 0)
+    if (detection_output == nullptr ||
+        prototype_output == nullptr)
     {
         fprintf(stderr,
-                "post_process failed, ret=%d\n",
-                post_ret);
+                "YOLOv8-Seg output buffer is null\n");
+
+        rknn_outputs_release(
+            ctx,
+            io_num.n_output,
+            outputs.data());
+
+        return orig_img;
+    }
+
+    const int output_channels =
+        static_cast<int>(output_attrs[0].dims[1]);
+
+    const int candidate_count =
+        static_cast<int>(output_attrs[0].dims[2]);
+
+    const int mask_channels =
+        static_cast<int>(output_attrs[1].dims[1]);
+
+    const int mask_height =
+        static_cast<int>(output_attrs[1].dims[2]);
+
+    const int mask_width =
+        static_cast<int>(output_attrs[1].dims[3]);
+
+    // output0通道组成：4个框坐标 + 类别置信度 + mask系数
+    const int class_count =
+        output_channels - 4 - mask_channels;
+
+    if (class_count <= 0 ||
+        candidate_count <= 0 ||
+        mask_channels <= 0 ||
+        mask_width <= 0 ||
+        mask_height <= 0)
+    {
+        fprintf(stderr,
+                "Invalid YOLOv8-Seg shape: "
+                "channels=%d candidates=%d classes=%d "
+                "mask=[%d,%d,%d]\n",
+                output_channels,
+                candidate_count,
+                class_count,
+                mask_channels,
+                mask_height,
+                mask_width);
+
+        rknn_outputs_release(
+            ctx,
+            io_num.n_output,
+            outputs.data());
+
+        return orig_img;
+    }
+
+    const float mask_threshold = 0.5f;
+    const int maximum_detections = 50;
+
+    std::vector<yolov8_seg_candidate_t> candidates;
+    candidates.reserve(100);
+
+    for (int candidate_index = 0;
+         candidate_index < candidate_count;
+         ++candidate_index)
+    {
+        int best_class_id = -1;
+        float best_confidence = 0.0f;
+
+        for (int class_index = 0;
+             class_index < class_count;
+             ++class_index)
+        {
+            const int channel = 4 + class_index;
+
+            const float confidence =
+                detection_output[
+                    channel * candidate_count +
+                    candidate_index];
+
+            if (confidence > best_confidence)
+            {
+                best_confidence = confidence;
+                best_class_id = class_index;
+            }
+        }
+
+        if (best_class_id < 0 ||
+            best_confidence < box_conf_threshold)
+        {
+            continue;
+        }
+
+        const float center_x =
+            detection_output[
+                0 * candidate_count +
+                candidate_index];
+
+        const float center_y =
+            detection_output[
+                1 * candidate_count +
+                candidate_index];
+
+        const float box_width =
+            detection_output[
+                2 * candidate_count +
+                candidate_index];
+
+        const float box_height =
+            detection_output[
+                3 * candidate_count +
+                candidate_index];
+
+        float model_left =
+            center_x - box_width * 0.5f;
+
+        float model_top =
+            center_y - box_height * 0.5f;
+
+        float model_right =
+            center_x + box_width * 0.5f;
+
+        float model_bottom =
+            center_y + box_height * 0.5f;
+
+        model_left =
+            std::max(
+                0.0f,
+                std::min(
+                    model_left,
+                    static_cast<float>(width - 1)));
+
+        model_top =
+            std::max(
+                0.0f,
+                std::min(
+                    model_top,
+                    static_cast<float>(height - 1)));
+
+        model_right =
+            std::max(
+                0.0f,
+                std::min(
+                    model_right,
+                    static_cast<float>(width)));
+
+        model_bottom =
+            std::max(
+                0.0f,
+                std::min(
+                    model_bottom,
+                    static_cast<float>(height)));
+
+        if (model_right <= model_left ||
+            model_bottom <= model_top)
+        {
+            continue;
+        }
+
+        int original_left =
+            static_cast<int>(
+                model_left / scale_w);
+
+        int original_top =
+            static_cast<int>(
+                model_top / scale_h);
+
+        int original_right =
+            static_cast<int>(
+                model_right / scale_w);
+
+        int original_bottom =
+            static_cast<int>(
+                model_bottom / scale_h);
+
+        original_left =
+            std::max(
+                0,
+                std::min(
+                    original_left,
+                    orig_img.cols - 1));
+
+        original_top =
+            std::max(
+                0,
+                std::min(
+                    original_top,
+                    orig_img.rows - 1));
+
+        original_right =
+            std::max(
+                0,
+                std::min(
+                    original_right,
+                    orig_img.cols));
+
+        original_bottom =
+            std::max(
+                0,
+                std::min(
+                    original_bottom,
+                    orig_img.rows));
+
+        if (original_right <= original_left ||
+            original_bottom <= original_top)
+        {
+            continue;
+        }
+
+        yolov8_seg_candidate_t candidate;
+
+        candidate.model_box = cv::Rect2f(
+            model_left,
+            model_top,
+            model_right - model_left,
+            model_bottom - model_top);
+
+        candidate.original_box = cv::Rect(
+            original_left,
+            original_top,
+            original_right - original_left,
+            original_bottom - original_top);
+
+        candidate.confidence = best_confidence;
+        candidate.class_id = best_class_id;
+
+        candidate.mask_coefficients.resize(
+            mask_channels);
+
+        for (int mask_channel = 0;
+             mask_channel < mask_channels;
+             ++mask_channel)
+        {
+            const int output_channel =
+                4 +
+                class_count +
+                mask_channel;
+
+            candidate.mask_coefficients[mask_channel] =
+                detection_output[
+                    output_channel * candidate_count +
+                    candidate_index];
+        }
+
+        candidates.push_back(candidate);
+    }
+
+    const std::vector<int> keep_indices =
+        perform_class_nms(
+            candidates,
+            nms_threshold);
+
+    int draw_count = 0;
+
+    for (size_t keep_position = 0;
+         keep_position < keep_indices.size();
+         ++keep_position)
+    {
+        if (draw_count >= maximum_detections)
+        {
+            break;
+        }
+
+        const yolov8_seg_candidate_t &candidate =
+            candidates[keep_indices[keep_position]];
+
+        cv::Mat mask_logits(
+            mask_height,
+            mask_width,
+            CV_32FC1,
+            cv::Scalar(0));
+
+        for (int mask_y = 0;
+             mask_y < mask_height;
+             ++mask_y)
+        {
+            float *mask_row =
+                mask_logits.ptr<float>(mask_y);
+
+            for (int mask_x = 0;
+                 mask_x < mask_width;
+                 ++mask_x)
+            {
+                const int pixel_index =
+                    mask_y * mask_width +
+                    mask_x;
+
+                float logit = 0.0f;
+
+                for (int mask_channel = 0;
+                     mask_channel < mask_channels;
+                     ++mask_channel)
+                {
+                    const int prototype_index =
+                        mask_channel *
+                            mask_height *
+                            mask_width +
+                        pixel_index;
+
+                    logit +=
+                        candidate.mask_coefficients[
+                            mask_channel] *
+                        prototype_output[
+                            prototype_index];
+                }
+
+                mask_row[mask_x] =
+                    1.0f /
+                    (1.0f + std::exp(-logit));
+            }
+        }
+
+        int prototype_left =
+            static_cast<int>(
+                candidate.model_box.x *
+                static_cast<float>(mask_width) /
+                static_cast<float>(width));
+
+        int prototype_top =
+            static_cast<int>(
+                candidate.model_box.y *
+                static_cast<float>(mask_height) /
+                static_cast<float>(height));
+
+        int prototype_right =
+            static_cast<int>(
+                (candidate.model_box.x +
+                 candidate.model_box.width) *
+                static_cast<float>(mask_width) /
+                static_cast<float>(width));
+
+        int prototype_bottom =
+            static_cast<int>(
+                (candidate.model_box.y +
+                 candidate.model_box.height) *
+                static_cast<float>(mask_height) /
+                static_cast<float>(height));
+
+        prototype_left =
+            std::max(
+                0,
+                std::min(
+                    prototype_left,
+                    mask_width - 1));
+
+        prototype_top =
+            std::max(
+                0,
+                std::min(
+                    prototype_top,
+                    mask_height - 1));
+
+        prototype_right =
+            std::max(
+                prototype_left + 1,
+                std::min(
+                    prototype_right,
+                    mask_width));
+
+        prototype_bottom =
+            std::max(
+                prototype_top + 1,
+                std::min(
+                    prototype_bottom,
+                    mask_height));
+
+        const cv::Rect prototype_roi(
+            prototype_left,
+            prototype_top,
+            prototype_right - prototype_left,
+            prototype_bottom - prototype_top);
+
+        cv::Mat cropped_mask =
+            mask_logits(prototype_roi);
+
+        cv::Mat resized_mask;
+
+        cv::resize(
+            cropped_mask,
+            resized_mask,
+            candidate.original_box.size(),
+            0.0,
+            0.0,
+            cv::INTER_LINEAR);
+
+        cv::Mat binary_mask;
+
+        cv::threshold(
+            resized_mask,
+            binary_mask,
+            mask_threshold,
+            255.0,
+            cv::THRESH_BINARY);
+
+        binary_mask.convertTo(
+            binary_mask,
+            CV_8UC1);
+
+        const int defect_pixels =
+            cv::countNonZero(binary_mask);
+
+        const int box_pixels =
+            candidate.original_box.width *
+            candidate.original_box.height;
+
+        const float defect_ratio =
+            box_pixels > 0
+                ? static_cast<float>(defect_pixels) /
+                      static_cast<float>(box_pixels)
+                : 0.0f;
+
+        const cv::Scalar color =
+            get_seg_color(candidate.class_id);
+
+        cv::Mat image_roi =
+            orig_img(candidate.original_box);
+
+        cv::Mat color_layer(
+            image_roi.size(),
+            image_roi.type(),
+            color);
+
+        cv::Mat blended_roi;
+
+        cv::addWeighted(
+            image_roi,
+            0.55,
+            color_layer,
+            0.45,
+            0.0,
+            blended_roi);
+
+        blended_roi.copyTo(
+            image_roi,
+            binary_mask);
+
+        cv::rectangle(
+            orig_img,
+            candidate.original_box,
+            color,
+            2);
+
+        char text[256];
+
+        snprintf(
+            text,
+            sizeof(text),
+            "%s %.1f%% area %.1f%%",
+            get_defect_name(candidate.class_id).c_str(),
+            candidate.confidence * 100.0f,
+            defect_ratio * 100.0f);
+
+        int text_y =
+            candidate.original_box.y > 18
+                ? candidate.original_box.y - 5
+                : candidate.original_box.y + 18;
+
+        cv::putText(
+            orig_img,
+            text,
+            cv::Point(
+                candidate.original_box.x,
+                text_y),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2);
+
+        ++draw_count;
     }
 
     // 输出数据使用完后及时释放
@@ -389,70 +1017,15 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         io_num.n_output,
         outputs.data());
 
-    if (ret < 0)
+    if (ret != RKNN_SUCC)
     {
         fprintf(stderr,
                 "rknn_outputs_release failed, ret=%d\n",
                 ret);
     }
 
-    // 绘制检测结果
-    char text[256];
-
-    for (int i = 0;
-         i < detect_result_group.count;
-         ++i)
-    {
-        detect_result_t *det_result =
-            &detect_result_group.results[i];
-
-        snprintf(
-            text,
-            sizeof(text),
-            "%s %.1f%%",
-            det_result->name,
-            det_result->prop * 100.0f);
-
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-
-        // 防止坐标超过原图范围
-        x1 = std::max(0, std::min(x1, orig_img.cols - 1));
-        y1 = std::max(0, std::min(y1, orig_img.rows - 1));
-        x2 = std::max(0, std::min(x2, orig_img.cols - 1));
-        y2 = std::max(0, std::min(y2, orig_img.rows - 1));
-
-        if (x2 <= x1 || y2 <= y1)
-        {
-            continue;
-        }
-
-        cv::rectangle(
-            orig_img,
-            cv::Point(x1, y1),
-            cv::Point(x2, y2),
-            cv::Scalar(255, 0, 0),
-            3);
-
-        int text_y = y1 > 18
-                         ? y1 - 5
-                         : y1 + 18;
-
-        cv::putText(
-            orig_img,
-            text,
-            cv::Point(x1, text_y),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.5,
-            cv::Scalar(255, 255, 255),
-            1);
-    }
-
     return orig_img;
 }
-
 rkYolov5s::~rkYolov5s()
 {
     deinitPostProcess();
