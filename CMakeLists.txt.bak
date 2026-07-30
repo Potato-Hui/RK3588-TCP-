@@ -1,0 +1,154 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(rknn_yolov5_demo LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 安装目录
+set(CMAKE_INSTALL_PREFIX
+    "${CMAKE_SOURCE_DIR}/install/rknn_yolov5_demo_${CMAKE_SYSTEM_NAME}"
+    CACHE PATH "Install prefix" FORCE
+)
+
+set(CMAKE_SKIP_INSTALL_RPATH FALSE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
+
+# ---------------------------------------------------------
+# 交叉编译时，配置 ARM64 pkg-config 搜索目录
+# 也可以在执行 cmake 前通过环境变量覆盖：
+# export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+# ---------------------------------------------------------
+if(CMAKE_CROSSCOMPILING)
+    set(ENV{PKG_CONFIG_LIBDIR}
+        "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+    )
+    set(ENV{PKG_CONFIG_SYSROOT_DIR} "/")
+endif()
+
+find_package(PkgConfig REQUIRED)
+
+# 原生 GStreamer：摄像头 appsink + 显示 appsrc
+pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
+    gstreamer-1.0
+    gstreamer-app-1.0
+)
+
+# ---------------------------------------------------------
+# RKNN
+# ---------------------------------------------------------
+set(RKNN_API_PATH "${CMAKE_SOURCE_DIR}/3rdparty/rknn")
+set(RKNN_RT_LIB "${CMAKE_SOURCE_DIR}/include/librknnrt.so")
+
+# ---------------------------------------------------------
+# RGA
+# ---------------------------------------------------------
+set(RGA_PATH "${CMAKE_SOURCE_DIR}/include/3rdparty/rga/RK3588")
+set(RGA_LIB "${RGA_PATH}/lib/Linux/aarch64/librga.so")
+
+# ---------------------------------------------------------
+# OpenCV 3.4.5 裁剪版
+# 不使用 videoio / highgui
+# ---------------------------------------------------------
+set(OPENCV_ROOT
+    "${CMAKE_SOURCE_DIR}/3rdparty/opencv/opencv-linux-aarch64"
+)
+set(OPENCV_INCLUDE_DIR "${OPENCV_ROOT}/include")
+set(OPENCV_LIB_DIR "${OPENCV_ROOT}/lib")
+
+set(OPENCV_STATIC_LIBS
+    "${OPENCV_LIB_DIR}/libopencv_dnn.a"
+    "${OPENCV_LIB_DIR}/libopencv_calib3d.a"
+    "${OPENCV_LIB_DIR}/libopencv_features2d.a"
+    "${OPENCV_LIB_DIR}/libopencv_video.a"
+    "${OPENCV_LIB_DIR}/libopencv_imgcodecs.a"
+    "${OPENCV_LIB_DIR}/libopencv_imgproc.a"
+    "${OPENCV_LIB_DIR}/libopencv_core.a"
+)
+
+# ---------------------------------------------------------
+# 基础检查
+# ---------------------------------------------------------
+foreach(required_file
+    "${RKNN_RT_LIB}"
+    "${RGA_LIB}"
+    "${OPENCV_LIB_DIR}/libopencv_core.a"
+    "${OPENCV_LIB_DIR}/libopencv_imgproc.a"
+)
+    if(NOT EXISTS "${required_file}")
+        message(FATAL_ERROR "Required file not found: ${required_file}")
+    endif()
+endforeach()
+
+# ---------------------------------------------------------
+# 可执行文件
+# ---------------------------------------------------------
+add_executable(rknn_yolov5_demo
+    src/main.cc
+    src/postprocess.cc
+    src/preprocess.cc
+    src/rkYolov5s.cc
+)
+
+target_include_directories(rknn_yolov5_demo PRIVATE
+    "${RKNN_API_PATH}/include"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/include/3rdparty"
+    "${RGA_PATH}/include"
+    "${OPENCV_INCLUDE_DIR}"
+)
+
+target_compile_options(rknn_yolov5_demo PRIVATE
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+)
+
+# OpenCV 为静态库，使用 start-group/end-group 解决循环依赖。
+# whole-archive 仅用于 tegra/carotene 库存在时。
+set(OPENCV_EXTRA_STATIC_LIBS)
+
+foreach(candidate
+    "${OPENCV_LIB_DIR}/libtegra_hal.a"
+    "${OPENCV_LIB_DIR}/libcarotene_o4t.a"
+    "${OPENCV_LIB_DIR}/libcarotene.a"
+)
+    if(EXISTS "${candidate}")
+        list(APPEND OPENCV_EXTRA_STATIC_LIBS "${candidate}")
+    endif()
+endforeach()
+
+target_link_libraries(rknn_yolov5_demo PRIVATE
+    "${RKNN_RT_LIB}"
+    "${RGA_LIB}"
+
+    -Wl,--start-group
+    ${OPENCV_STATIC_LIBS}
+    ${OPENCV_EXTRA_STATIC_LIBS}
+    -Wl,--end-group
+
+    PkgConfig::GSTREAMER
+
+    pthread
+    dl
+    m
+    z
+)
+
+# 某些板端动态库的间接依赖只在运行时解析
+target_link_options(rknn_yolov5_demo PRIVATE
+    -Wl,--allow-shlib-undefined
+)
+
+# ---------------------------------------------------------
+# 安装
+# ---------------------------------------------------------
+install(TARGETS rknn_yolov5_demo DESTINATION .)
+install(PROGRAMS "${RKNN_RT_LIB}" DESTINATION lib)
+install(PROGRAMS "${RGA_LIB}" DESTINATION lib)
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/model")
+    install(DIRECTORY "${CMAKE_SOURCE_DIR}/model" DESTINATION .)
+endif()
