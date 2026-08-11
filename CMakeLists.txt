@@ -91,7 +91,23 @@ add_executable(rknn_yolov5_demo
     src/postprocess.cc
     src/preprocess.cc
     src/rkYolov5s.cc
+    src/tcp_jpeg_publisher.cpp
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    foreach(test_name
+        letterbox_geometry
+        camera_pipeline
+        video_publisher_pipeline
+        monitor_protocol)
+        add_executable(${test_name}_test tests/${test_name}_test.cpp)
+        target_include_directories(${test_name}_test PRIVATE
+            "${CMAKE_SOURCE_DIR}/include")
+        target_compile_options(${test_name}_test PRIVATE -Wall -Wextra)
+        add_test(NAME ${test_name}_test COMMAND ${test_name}_test)
+    endforeach()
+endif()
 
 target_include_directories(rknn_yolov5_demo PRIVATE
     "${RKNN_API_PATH}/include"

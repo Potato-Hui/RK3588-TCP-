@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,14 +21,26 @@
 
 #include "rkYolov5s.hpp"
 #include "rknnPool.hpp"
+#include "camera_pipeline.hpp"
+#include "monitor_protocol.hpp"
+#include "tcp_jpeg_publisher.hpp"
 
 namespace {
 
-constexpr int kDefaultWidth = 640;
-constexpr int kDefaultHeight = 480;
+constexpr int kDefaultWidth = 1280;
+constexpr int kDefaultHeight = 720;
 constexpr int kDefaultFps = 30;
 constexpr int kDefaultThreadNum = 12;
-constexpr const char* kDefaultCamera = "/dev/video22";
+constexpr const char* kDefaultCamera = "/dev/video41";
+constexpr int kTcpPort = 5000;
+volatile std::sig_atomic_t gStopRequested = 0;
+
+void signalHandler(int) { gStopRequested = 1; }
+void writeProtocolLine(const std::string& line)
+{
+    std::fprintf(stdout, "%s\n", line.c_str());
+    std::fflush(stdout);
+}
 
 // -----------------------------------------------------------------------------
 // GStreamer 摄像头：v4l2src -> NV12 -> videoconvert -> BGR -> appsink
@@ -48,12 +61,7 @@ public:
         fps_ = fps;
 
         const std::string pipeline_desc =
-        "v4l2src device=" + device + " ! "
-        "image/jpeg,width=1280,height=720,framerate=30/1 ! "
-        "queue max-size-buffers=2 leaky=downstream ! "
-        "jpegdec ! videoconvert ! videoscale ! "
-        "video/x-raw,format=BGR,width=640,height=640 ! "
-        "appsink name=camera_sink drop=true max-buffers=1";
+            buildCameraPipelineDescription(device, width, height, fps);
 
         GError* error = nullptr;
         pipeline_ = gst_parse_launch(pipeline_desc.c_str(), &error);
@@ -350,11 +358,10 @@ void drawHud(cv::Mat& frame,
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf(
-            "Usage: %s <model.rknn> [camera_device] [thread_num] [sink]\n"
+            "Usage: %s <model.rknn> [camera_device] [thread_num]\n"
             "Example:\n"
-            "  %s model/det.rknn /dev/video22 12 autovideosink\n"
-            "  %s model/det.rknn /dev/video22 12 waylandsink\n",
-            argv[0], argv[0], argv[0]);
+            "  %s model/RK3588/best_yolov8_fp16.rknn /dev/video41 12\n",
+            argv[0], argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -369,15 +376,15 @@ int main(int argc, char** argv) {
         thread_num = kDefaultThreadNum;
     }
 
-    const std::string display_sink =
-        (argc >= 5) ? argv[4] : "autovideosink";
-
     gst_init(&argc, &argv);
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
 
     rknnPool<rkYolov5s, cv::Mat, cv::Mat> test_pool(
         const_cast<char*>(model_name), thread_num);
 
     if (test_pool.init() != 0) {
+        writeProtocolLine(makeErrorStatus("model_init_failed", "rknnPool init failed"));
         std::fprintf(stderr, "rknnPool init failed\n");
         return EXIT_FAILURE;
     }
@@ -387,23 +394,19 @@ int main(int argc, char** argv) {
                      kDefaultWidth,
                      kDefaultHeight,
                      kDefaultFps)) {
+        writeProtocolLine(makeErrorStatus(
+            "camera_open_failed", "Failed to open camera"));
         std::fprintf(stderr,
                      "Failed to open camera: %s\n",
                      camera_device.c_str());
         return EXIT_FAILURE;
     }
 
-    GstDisplay display;
-    const bool display_enabled =
-        display.open(kDefaultWidth,
-                     kDefaultHeight,
-                     kDefaultFps,
-                     display_sink);
-
-    if (!display_enabled) {
-        std::fprintf(stderr,
-                     "Display pipeline failed; inference will continue "
-                     "without video output.\n");
+    TcpJpegPublisher publisher;
+    if (!publisher.open(kDefaultWidth, kDefaultHeight, kDefaultFps,
+                        80, "127.0.0.1", kTcpPort)) {
+        writeProtocolLine(makeErrorStatus("publisher_open_failed", publisher.lastError()));
+        return EXIT_FAILURE;
     }
 
     timeval time_value{};
@@ -418,16 +421,20 @@ int main(int argc, char** argv) {
 
     int submitted_frames = 0;
     int output_frames = 0;
+    int period_output_frames = 0;
     double fps_ema = 0.0;
 
     std::printf(
-        "Model: %s\nCamera: %s\nThreads: %d\nDisplay sink: %s\n",
+        "Model: %s\nCamera: %s\nThreads: %d\nTCP-JPEG: 127.0.0.1:%d\n",
         model_name,
         camera_device.c_str(),
         thread_num,
-        display_sink.c_str());
+        kTcpPort);
+    std::fflush(stdout);
+    writeProtocolLine(makeReadyStatus(kDefaultWidth, kDefaultHeight,
+                                      kDefaultFps, kTcpPort));
 
-    while (true) {
+    while (!gStopRequested) {
         cv::Mat camera_frame;
         if (!camera.read(camera_frame)) {
             std::fprintf(stderr, "Camera frame read failed\n");
@@ -471,8 +478,9 @@ int main(int argc, char** argv) {
                     fps_ema,
                     output_frames);
 
-            if (display_enabled && !display.push(result_frame)) {
-                std::fprintf(stderr, "Display push failed\n");
+            if (!publisher.push(result_frame)) {
+                writeProtocolLine(makeErrorStatus("publisher_push_failed", publisher.lastError()));
+                break;
             }
 
             std::printf(
@@ -482,21 +490,25 @@ int main(int argc, char** argv) {
                 elapsed_ms,
                 fps_ema);
 
-            if (output_frames % 120 == 0) {
-                gettimeofday(&time_value, nullptr);
-                const auto now_ms =
-                    time_value.tv_sec * 1000LL +
-                    time_value.tv_usec / 1000LL;
-
-                const double avg_120 =
-                    120000.0 /
+            gettimeofday(&time_value, nullptr);
+            const auto now_ms =
+                time_value.tv_sec * 1000LL +
+                time_value.tv_usec / 1000LL;
+            if (now_ms - period_start_ms >= 1000) {
+                const double period_fps =
+                    static_cast<double>(output_frames - period_output_frames) * 1000.0 /
                     static_cast<double>(now_ms - period_start_ms);
-
                 std::printf(
-                    "Average FPS over last 120 output frames: %.3f\n",
-                    avg_120);
+                    "Pipeline FPS: %.3f\n",
+                    period_fps);
+                writeProtocolLine(makeMetricsStatus(
+                    static_cast<double>(submitted_frames) * 1000.0 /
+                        static_cast<double>(now_ms - start_time_ms),
+                    period_fps,
+                    elapsed_ms));
 
                 period_start_ms = now_ms;
+                period_output_frames = output_frames;
             }
         }
     }
@@ -514,9 +526,7 @@ int main(int argc, char** argv) {
                 fps_ema,
                 output_frames);
 
-        if (display_enabled) {
-            display.push(result_frame);
-        }
+        publisher.push(result_frame);
     }
 
     gettimeofday(&time_value, nullptr);
@@ -536,7 +546,7 @@ int main(int argc, char** argv) {
         output_frames,
         average_fps);
 
-    display.close();
+    publisher.close();
     camera.close();
     return EXIT_SUCCESS;
 }

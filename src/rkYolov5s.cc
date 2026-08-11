@@ -11,6 +11,7 @@
 
 #include "coreNum.hpp"
 #include "rkYolov5s.hpp"
+#include "letterbox_geometry.hpp"
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -389,24 +390,15 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
     img_width = img.cols;
     img_height = img.rows;
 
-    BOX_RECT pads;
-    memset(&pads, 0, sizeof(BOX_RECT));
-
-    const cv::Size target_size(width, height);
+    const LetterboxGeometry geometry =
+        makeLetterboxGeometry(img.cols, img.rows, width, height);
 
     cv::Mat resized_img(
-        target_size.height,
-        target_size.width,
+        geometry.resizedHeight,
+        geometry.resizedWidth,
         CV_8UC3);
-
-    // 当前 RGA resize 是直接拉伸到模型输入尺寸，不使用 letterbox
-    float scale_w =
-        static_cast<float>(target_size.width) /
-        static_cast<float>(img.cols);
-
-    float scale_h =
-        static_cast<float>(target_size.height) /
-        static_cast<float>(img.rows);
+    cv::Mat model_input(height, width, CV_8UC3,
+                        cv::Scalar(114, 114, 114));
 
     if (img_width != width || img_height != height)
     {
@@ -421,7 +413,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             dst,
             img,
             resized_img,
-            target_size);
+            resized_img.size());
 
         if (ret != 0)
         {
@@ -441,12 +433,15 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             return orig_img;
         }
 
-        inputs[0].buf = resized_img.data;
+        resized_img.copyTo(model_input(cv::Rect(
+            geometry.padLeft,
+            geometry.padTop,
+            geometry.resizedWidth,
+            geometry.resizedHeight)));
+        inputs[0].buf = model_input.data;
     }
     else
     {
-        scale_w = 1.0f;
-        scale_h = 1.0f;
         inputs[0].buf = img.data;
     }
 
@@ -699,21 +694,29 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             continue;
         }
 
-        int original_left =
-            static_cast<int>(
-                model_left / scale_w);
+        const FloatRect mapped = mapModelRectToSource(
+            FloatRect{model_left, model_top,
+                      model_right - model_left,
+                      model_bottom - model_top},
+            geometry);
+        if (mapped.width <= 0.0f || mapped.height <= 0.0f)
+        {
+            continue;
+        }
 
-        int original_top =
-            static_cast<int>(
-                model_top / scale_h);
+        const float content_left = static_cast<float>(geometry.padLeft);
+        const float content_top = static_cast<float>(geometry.padTop);
+        const float content_right = content_left + geometry.resizedWidth;
+        const float content_bottom = content_top + geometry.resizedHeight;
+        model_left = std::max(model_left, content_left);
+        model_top = std::max(model_top, content_top);
+        model_right = std::min(model_right, content_right);
+        model_bottom = std::min(model_bottom, content_bottom);
 
-        int original_right =
-            static_cast<int>(
-                model_right / scale_w);
-
-        int original_bottom =
-            static_cast<int>(
-                model_bottom / scale_h);
+        int original_left = static_cast<int>(std::floor(mapped.x));
+        int original_top = static_cast<int>(std::floor(mapped.y));
+        int original_right = static_cast<int>(std::ceil(mapped.x + mapped.width));
+        int original_bottom = static_cast<int>(std::ceil(mapped.y + mapped.height));
 
         original_left =
             std::max(
