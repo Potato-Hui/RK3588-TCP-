@@ -18,13 +18,14 @@ bool TcpJpegPublisher::open(int width, int height, int fps, int quality,
         if (error) {
             lastError_ = error->message;
             g_error_free(error);
-        }
+        } 
     } catch (const std::exception& error) {
         lastError_ = error.what();
         return false;
     }
     if (!pipeline_ || !lastError_.empty()) { close(); return false; }
     appSrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "video_source");
+    //遍历 bin（也就是整条流水线）内部所有子插件，找到 name="video_source" 的那一个，返回它的指针。
     if (!appSrc_) { lastError_ = "cannot find appsrc video_source"; close(); return false; }
     GstCaps* caps = gst_caps_new_simple(
         "video/x-raw", "format", G_TYPE_STRING, "BGR",
