@@ -242,7 +242,9 @@ ls -l /sys/fs/pstore
 - NPU 任务超过 6 秒超时；
 - 最终触发 RKNPU 驱动异常。
 
-经过测试，裁剪后的yolov8s_seg_ReLU_pruned10.rknn(18.4 MB)模型运行半小时后死机，在进行计算时CPU负载在90%以上。
+经过测试
+使用12个线程运行裁剪后的yolov8s_seg_ReLU_pruned10.rknn(18.4 MB)模型运行半小时后死机，在进行计算时CPU负载在90%以上。
+使用6个线程运行裁剪后的yolov8s_seg_ReLU_pruned10.rknn(18.4 MB)模型运行一小时后仍可以正常运行，在进行计算时CPU负载在50%以上。
 
 ### 3. Qt 提示找不到程序或模型
 
