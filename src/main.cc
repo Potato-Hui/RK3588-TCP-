@@ -3,20 +3,30 @@
 #include <gst/gst.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <fcntl.h>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <thread>
+#include <unistd.h>
 
 #include "opencv2/core/core.hpp"
+#include "opencv2/imgcodecs/imgcodecs.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 
 #include "rkYolov5s.hpp"
@@ -33,6 +43,7 @@ constexpr int kDefaultFps = 30;
 constexpr int kDefaultThreadNum = 12;
 constexpr const char* kDefaultCamera = "/dev/video41";
 constexpr int kTcpPort = 5000;
+constexpr const char* kRecordsRoot = "/data/records/";
 volatile std::sig_atomic_t gStopRequested = 0;
 
 void signalHandler(int) { gStopRequested = 1; }
@@ -40,6 +51,200 @@ void writeProtocolLine(const std::string& line)
 {
     std::fprintf(stdout, "%s\n", line.c_str());
     std::fflush(stdout);
+}
+
+struct SnapshotRequest {
+    std::string requestId;
+    std::string outputDir;
+};
+
+bool readJsonString(const std::string& json, const char* key, std::string* value)
+{
+    const std::string name = std::string("\"") + key + "\"";
+    const std::size_t key_pos = json.find(name);
+    if (key_pos == std::string::npos) return false;
+    const std::size_t colon = json.find(':', key_pos + name.size());
+    const std::size_t first_quote = json.find('\"', colon + 1);
+    if (colon == std::string::npos || first_quote == std::string::npos) return false;
+    const std::size_t second_quote = json.find('\"', first_quote + 1);
+    if (second_quote == std::string::npos) return false;
+    *value = json.substr(first_quote + 1, second_quote - first_quote - 1);
+    return true;
+}
+
+bool isSafeSnapshotRequest(const SnapshotRequest& request)
+{
+    if (request.requestId.empty()
+        || request.outputDir != std::string(kRecordsRoot) + request.requestId) {
+        return false;
+    }
+    for (const unsigned char ch : request.requestId) {
+        if (!std::isalnum(ch) && ch != '-') return false;
+    }
+    return true;
+}
+
+bool pollSnapshotRequest(std::string* input_buffer, SnapshotRequest* request)
+{
+    char buffer[512];
+    for (;;) {
+        const ssize_t count = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (count <= 0) break;
+        input_buffer->append(buffer, static_cast<std::size_t>(count));
+    }
+
+    const std::size_t line_end = input_buffer->find('\n');
+    if (line_end == std::string::npos) return false;
+    std::string line = input_buffer->substr(0, line_end);
+    input_buffer->erase(0, line_end + 1);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.compare(0, 10, "@snapshot ") != 0) return false;
+
+    return readJsonString(line.substr(10), "request_id", &request->requestId)
+        && readJsonString(line.substr(10), "output_dir", &request->outputDir)
+        && isSafeSnapshotRequest(*request);
+}
+
+void writeSnapshotReply(const SnapshotRequest& request,
+                        const char* state,
+                        const std::string& message = std::string())
+{
+    std::ostringstream out;
+    out << "@snapshot {\"request_id\":\"" << jsonEscape(request.requestId)
+        << "\",\"state\":\"" << state << "\"";
+    if (std::string(state) == "ready") {
+        out << ",\"record_dir\":\"" << jsonEscape(request.outputDir) << "\"";
+    } else {
+        out << ",\"message\":\"" << jsonEscape(message) << "\"";
+    }
+    out << "}";
+    writeProtocolLine(out.str());
+}
+
+bool mapClass(int model_class_id, int* class_id, const char** class_name)
+{
+    switch (model_class_id) {
+    case 0: *class_id = 0; *class_name = "insulator"; return true;
+    case 1: *class_id = 1; *class_name = "crack"; return true;
+    case 2: *class_id = 2; *class_name = "pollution"; return true;
+    case 3: *class_id = 3; *class_name = "flashover"; return true;
+    case 4: *class_id = 4; *class_name = "broken"; return true;
+    default: return false;
+    }
+}
+
+void removeTemporaryRecord(const std::string& directory, int mask_count)
+{
+    std::remove((directory + "/image.jpg").c_str());
+    std::remove((directory + "/metadata.json").c_str());
+    for (int index = 1; index <= mask_count; ++index) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "/masks/instance_%02d.png", index);
+        std::remove((directory + name).c_str());
+    }
+    ::rmdir((directory + "/masks").c_str());
+    ::rmdir(directory.c_str());
+}
+
+bool saveSnapshot(const SnapshotRequest& request,
+                  const InferenceResult& result,
+                  std::string* error)
+{
+    if (!result.succeeded || result.originalFrame.empty()) {
+        *error = "当前帧推理未成功，无法保存快照";
+        return false;
+    }
+
+    const std::string temporary_dir = request.outputDir + ".tmp";
+    if (::mkdir(temporary_dir.c_str(), 0755) != 0
+        || ::mkdir((temporary_dir + "/masks").c_str(), 0755) != 0) {
+        *error = "无法创建快照目录";
+        removeTemporaryRecord(temporary_dir, 0);
+        return false;
+    }
+
+    int saved_masks = 0;
+    const std::string image_path = temporary_dir + "/image.jpg";
+    if (!cv::imwrite(image_path, result.originalFrame,
+                     std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 95})) {
+        *error = "无法保存原始图片";
+        removeTemporaryRecord(temporary_dir, saved_masks);
+        return false;
+    }
+
+    std::ofstream metadata((temporary_dir + "/metadata.json").c_str());
+    if (!metadata) {
+        *error = "无法写入 metadata.json";
+        removeTemporaryRecord(temporary_dir, saved_masks);
+        return false;
+    }
+
+    metadata << "{\n  \"image_width\": " << result.originalFrame.cols
+             << ",\n  \"image_height\": " << result.originalFrame.rows
+             << ",\n  \"instances\": [";
+    bool first = true;
+    int instance_index = 0;
+    for (const SegmentationInstance& instance : result.instances) {
+        ++instance_index;
+        int class_id = -1;
+        const char* class_name = nullptr;
+        if (!mapClass(instance.classId, &class_id, &class_name)) {
+            *error = "实例 " + std::to_string(instance_index)
+                + " 的模型类别 " + std::to_string(instance.classId)
+                + " 未配置到快照接口";
+            metadata.close();
+            removeTemporaryRecord(temporary_dir, saved_masks);
+            return false;
+        }
+        if (instance.mask.empty() || instance.mask.type() != CV_8UC1
+            || instance.bbox.x < 0 || instance.bbox.y < 0
+            || instance.bbox.width <= 0 || instance.bbox.height <= 0
+            || instance.bbox.x + instance.bbox.width > result.originalFrame.cols
+            || instance.bbox.y + instance.bbox.height > result.originalFrame.rows
+            || instance.mask.size() != instance.bbox.size()) {
+            std::ostringstream detail;
+            detail << "实例 " << instance_index << " 的 bbox 或 mask 无效"
+                   << " (bbox=" << instance.bbox.x << ',' << instance.bbox.y
+                   << ',' << instance.bbox.width << ',' << instance.bbox.height
+                   << ", mask=" << instance.mask.cols << 'x' << instance.mask.rows
+                   << ", type=" << instance.mask.type() << ')';
+            *error = detail.str();
+            metadata.close();
+            removeTemporaryRecord(temporary_dir, saved_masks);
+            return false;
+        }
+
+        ++saved_masks;
+        char mask_file[64];
+        std::snprintf(mask_file, sizeof(mask_file), "masks/instance_%02d.png", saved_masks);
+        if (!cv::imwrite(temporary_dir + "/" + mask_file, instance.mask)) {
+            *error = "无法保存实例 mask";
+            metadata.close();
+            removeTemporaryRecord(temporary_dir, saved_masks);
+            return false;
+        }
+
+        metadata << (first ? "\n" : ",\n")
+                 << "    {\"instance_id\": " << saved_masks
+                 << ", \"class_id\": " << class_id
+                 << ", \"class_name\": \"" << class_name << "\""
+                 << ", \"confidence\": " << std::fixed << std::setprecision(6)
+                 << instance.confidence
+                 << ", \"bbox_xyxy\": [" << instance.bbox.x << ", "
+                 << instance.bbox.y << ", "
+                 << instance.bbox.x + instance.bbox.width << ", "
+                 << instance.bbox.y + instance.bbox.height << "]"
+                 << ", \"mask_file\": \"" << mask_file << "\"}";
+        first = false;
+    }
+    metadata << "\n  ]\n}\n";
+    metadata.close();
+    if (!metadata || std::rename(temporary_dir.c_str(), request.outputDir.c_str()) != 0) {
+        *error = "无法发布快照记录";
+        removeTemporaryRecord(temporary_dir, saved_masks);
+        return false;
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -380,7 +585,16 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
 
-    rknnPool<rkYolov5s, cv::Mat, cv::Mat> test_pool(
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (stdin_flags < 0
+        || fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK) != 0) {
+        writeProtocolLine(makeErrorStatus(
+            "stdin_setup_failed", "Failed to configure snapshot input"));
+        std::fprintf(stderr, "Failed to configure non-blocking stdin\n");
+        return EXIT_FAILURE;
+    }
+
+    rknnPool<rkYolov5s, cv::Mat, InferenceResult> test_pool(
         const_cast<char*>(model_name), thread_num);
 
     if (test_pool.init() != 0) {
@@ -423,6 +637,8 @@ int main(int argc, char** argv) {
     int output_frames = 0;
     int period_output_frames = 0;
     double fps_ema = 0.0;
+    std::string snapshot_input;
+    std::deque<SnapshotRequest> pending_snapshots;
 
     std::printf(
         "Model: %s\nCamera: %s\nThreads: %d\nTCP-JPEG: 127.0.0.1:%d\n",
@@ -435,6 +651,15 @@ int main(int argc, char** argv) {
                                       kDefaultFps, kTcpPort));
 
     while (!gStopRequested) {
+        SnapshotRequest request;
+        while (pollSnapshotRequest(&snapshot_input, &request)) {
+            if (pending_snapshots.empty()) {
+                pending_snapshots.push_back(request);
+            } else {
+                writeSnapshotReply(request, "error", "上一张快照仍在生成");
+            }
+        }
+
         cv::Mat camera_frame;
         if (!camera.read(camera_frame)) {
             std::fprintf(stderr, "Camera frame read failed\n");
@@ -450,11 +675,24 @@ int main(int argc, char** argv) {
 
         // 线程池预热完成后，每送入一帧取出一帧
         if (submitted_frames >= thread_num) {
-            cv::Mat result_frame;
-            if (test_pool.get(result_frame) != 0) {
+            InferenceResult inference_result;
+            if (test_pool.get(inference_result) != 0) {
                 std::fprintf(stderr, "rknnPool get failed\n");
                 break;
             }
+
+            if (!pending_snapshots.empty()) {
+                std::string error;
+                const SnapshotRequest snapshot = pending_snapshots.front();
+                pending_snapshots.pop_front();
+                if (saveSnapshot(snapshot, inference_result, &error)) {
+                    writeSnapshotReply(snapshot, "ready");
+                } else {
+                    writeSnapshotReply(snapshot, "error", error);
+                }
+            }
+
+            cv::Mat result_frame = inference_result.annotatedFrame;
 
             ++output_frames;
 
@@ -515,10 +753,23 @@ int main(int argc, char** argv) {
 
     // 排空线程池中尚未取出的结果
     while (output_frames < submitted_frames) {
-        cv::Mat result_frame;
-        if (test_pool.get(result_frame) != 0) {
+        InferenceResult inference_result;
+        if (test_pool.get(inference_result) != 0) {
             break;
         }
+
+        if (!pending_snapshots.empty()) {
+            std::string error;
+            const SnapshotRequest snapshot = pending_snapshots.front();
+            pending_snapshots.pop_front();
+            if (saveSnapshot(snapshot, inference_result, &error)) {
+                writeSnapshotReply(snapshot, "ready");
+            } else {
+                writeSnapshotReply(snapshot, "error", error);
+            }
+        }
+
+        cv::Mat result_frame = inference_result.annotatedFrame;
 
         ++output_frames;
         drawHud(result_frame,
@@ -550,3 +801,4 @@ int main(int argc, char** argv) {
     camera.close();
     return EXIT_SUCCESS;
 }
+

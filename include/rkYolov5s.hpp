@@ -5,10 +5,30 @@
 
 #include "opencv2/core/core.hpp"
 
+#include <mutex>
+#include <string>
+#include <vector>
+
 static void dump_tensor_attr(rknn_tensor_attr *attr);
 static unsigned char *load_data(FILE *fp, size_t ofst, size_t sz);
 static unsigned char *load_model(const char *filename, int *model_size);
 static int saveFloat(const char *file_name, float *output, int element_size);
+
+struct SegmentationInstance
+{
+    int classId = -1;
+    float confidence = 0.0f;
+    cv::Rect bbox;
+    cv::Mat mask;
+};
+
+struct InferenceResult
+{
+    cv::Mat originalFrame;
+    cv::Mat annotatedFrame;
+    std::vector<SegmentationInstance> instances;
+    bool succeeded = false;
+};
 
 class rkYolov5s
 {
@@ -33,7 +53,7 @@ public:
     rkYolov5s(const std::string &model_path);
     int init(rknn_context *ctx_in, bool isChild);
     rknn_context *get_pctx();
-    cv::Mat infer(cv::Mat &ori_img);
+    InferenceResult infer(cv::Mat &ori_img);
     ~rkYolov5s();
 };
 

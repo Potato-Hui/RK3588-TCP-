@@ -57,6 +57,7 @@ set(OPENCV_ROOT
 )
 set(OPENCV_INCLUDE_DIR "${OPENCV_ROOT}/include")
 set(OPENCV_LIB_DIR "${OPENCV_ROOT}/lib")
+set(OPENCV_3RDPARTY_LIB_DIR "${OPENCV_ROOT}/share/OpenCV/3rdparty/lib")
 
 set(OPENCV_STATIC_LIBS
     "${OPENCV_LIB_DIR}/libopencv_dnn.a"
@@ -69,6 +70,18 @@ set(OPENCV_STATIC_LIBS
     "${OPENCV_ROOT}/share/OpenCV/3rdparty/lib/libtegra_hal.a"
 )
 
+# imgcodecs is static in this SDK.  Keep its codec dependencies alongside
+# OpenCV; otherwise JPEG/OpenEXR symbols remain unresolved at link time.
+set(OPENCV_CODEC_STATIC_LIBS
+    "${OPENCV_3RDPARTY_LIB_DIR}/libzlib.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/liblibjpeg-turbo.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/liblibwebp.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/liblibpng.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/liblibtiff.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/liblibjasper.a"
+    "${OPENCV_3RDPARTY_LIB_DIR}/libIlmImf.a"
+)
+
 # ---------------------------------------------------------
 # 基础检查
 # ---------------------------------------------------------
@@ -77,6 +90,8 @@ foreach(required_file
     "${RGA_LIB}"
     "${OPENCV_LIB_DIR}/libopencv_core.a"
     "${OPENCV_LIB_DIR}/libopencv_imgproc.a"
+    "${OPENCV_LIB_DIR}/libopencv_imgcodecs.a"
+    ${OPENCV_CODEC_STATIC_LIBS}
 )
     if(NOT EXISTS "${required_file}")
         message(FATAL_ERROR "Required file not found: ${required_file}")
@@ -144,6 +159,7 @@ target_link_libraries(rknn_yolov5_demo PRIVATE
 
     -Wl,--start-group
     ${OPENCV_STATIC_LIBS}
+    ${OPENCV_CODEC_STATIC_LIBS}
     ${OPENCV_EXTRA_STATIC_LIBS}
     -Wl,--end-group
 
@@ -152,6 +168,7 @@ target_link_libraries(rknn_yolov5_demo PRIVATE
     pthread
     dl
     m
+    rt
     z
 )
 
@@ -170,3 +187,4 @@ install(PROGRAMS "${RGA_LIB}" DESTINATION lib)
 if(EXISTS "${CMAKE_SOURCE_DIR}/model")
     install(DIRECTORY "${CMAKE_SOURCE_DIR}/model" DESTINATION .)
 endif()
+

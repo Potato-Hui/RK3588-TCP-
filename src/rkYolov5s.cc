@@ -360,9 +360,11 @@ static std::string get_defect_name(int class_id)
     // 类别顺序必须和训练数据集中的类别顺序完全一致
     static const std::vector<std::string> class_names =
     {
-        "broken",
+        "insulator",
         "crack",
-        "ablation"
+        "pollution",
+        "flashover",
+        "broken"
     };
 
     if (class_id >= 0 &&
@@ -373,15 +375,20 @@ static std::string get_defect_name(int class_id)
 
     return "class_" + std::to_string(class_id);
 }
-cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
+InferenceResult rkYolov5s::infer(cv::Mat &orig_img)
 {
+    InferenceResult result;
     std::lock_guard<std::mutex> lock(mtx);
 
     if (orig_img.empty())
     {
         fprintf(stderr, "infer: input image is empty\n");
-        return orig_img;
+        return result;
     }
+
+    result.originalFrame = orig_img.clone();
+    result.annotatedFrame = orig_img.clone();
+    cv::Mat &annotated_img = result.annotatedFrame;
 
     // OpenCV 摄像头图像为 BGR，模型输入为 RGB
     cv::Mat img;
@@ -421,7 +428,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                     "resize_rga failed, ret=%d\n",
                     ret);
 
-            return orig_img;
+            return result;
         }
 
         if (resized_img.empty() ||
@@ -430,7 +437,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             fprintf(stderr,
                     "resize_rga returned an empty image\n");
 
-            return orig_img;
+            return result;
         }
 
         resized_img.copyTo(model_input(cv::Rect(
@@ -457,7 +464,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 "rknn_inputs_set failed, ret=%d\n",
                 ret);
 
-        return orig_img;
+        return result;
     }
 
     // YOLOv8-Seg需要两个输出：检测结果和原型掩码
@@ -467,7 +474,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 "YOLOv8-Seg expects 2 outputs, but model has %u outputs\n",
                 io_num.n_output);
 
-        return orig_img;
+        return result;
     }
 
     if (output_attrs[0].n_dims != 3 ||
@@ -479,7 +486,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 output_attrs[0].n_dims,
                 output_attrs[1].n_dims);
 
-        return orig_img;
+        return result;
     }
 
     std::vector<rknn_output> outputs(io_num.n_output);
@@ -508,7 +515,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 "rknn_run failed, ret=%d\n",
                 ret);
 
-        return orig_img;
+        return result;
     }
 
     // 获取输出
@@ -524,7 +531,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 "rknn_outputs_get failed, ret=%d\n",
                 ret);
 
-        return orig_img;
+        return result;
     }
 
     const float *detection_output =
@@ -544,7 +551,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             io_num.n_output,
             outputs.data());
 
-        return orig_img;
+        return result;
     }
 
     const int output_channels =
@@ -588,7 +595,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             io_num.n_output,
             outputs.data());
 
-        return orig_img;
+        return result;
     }
 
     const float mask_threshold = 0.5f;
@@ -957,8 +964,15 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         const cv::Scalar color =
             get_seg_color(candidate.class_id);
 
+        SegmentationInstance instance;
+        instance.classId = candidate.class_id;
+        instance.confidence = candidate.confidence;
+        instance.bbox = candidate.original_box;
+        instance.mask = binary_mask.clone();
+        result.instances.push_back(instance);
+
         cv::Mat image_roi =
-            orig_img(candidate.original_box);
+            annotated_img(candidate.original_box);
 
         cv::Mat color_layer(
             image_roi.size(),
@@ -980,7 +994,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
             binary_mask);
 
         cv::rectangle(
-            orig_img,
+            annotated_img,
             candidate.original_box,
             color,
             2);
@@ -1001,7 +1015,7 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
                 : candidate.original_box.y + 18;
 
         cv::putText(
-            orig_img,
+            annotated_img,
             text,
             cv::Point(
                 candidate.original_box.x,
@@ -1025,9 +1039,12 @@ cv::Mat rkYolov5s::infer(cv::Mat &orig_img)
         fprintf(stderr,
                 "rknn_outputs_release failed, ret=%d\n",
                 ret);
+
+        return result;
     }
 
-    return orig_img;
+    result.succeeded = true;
+    return result;
 }
 rkYolov5s::~rkYolov5s()
 {
@@ -1043,3 +1060,4 @@ rkYolov5s::~rkYolov5s()
     if (output_attrs)
         free(output_attrs);
 }
+
