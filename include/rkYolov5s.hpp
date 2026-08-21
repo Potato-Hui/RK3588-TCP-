@@ -2,10 +2,12 @@
 #define RKYOLOV5S_H
 
 #include "rknn_api.h"
+#include "detection_thresholds.hpp"
 
 #include "opencv2/core/core.hpp"
 
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -47,10 +49,14 @@ private:
     int channel, width, height;
     int img_width, img_height;
 
-    float nms_threshold, box_conf_threshold;
+    float nms_threshold;
+    std::shared_ptr<const DetectionThresholds> confidence_thresholds;
 
 public:
     rkYolov5s(const std::string &model_path);
+    rkYolov5s(
+        const std::string& model_path,
+        std::shared_ptr<const DetectionThresholds> confidence_thresholds);
     int init(rknn_context *ctx_in, bool isChild);
     rknn_context *get_pctx();
     InferenceResult infer(cv::Mat &ori_img);

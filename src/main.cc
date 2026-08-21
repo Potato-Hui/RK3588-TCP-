@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
+#include <limits.h>
 #include <sstream>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,17 @@ constexpr const char* kDefaultCamera = "/dev/video41";
 constexpr int kTcpPort = 5000;
 constexpr const char* kRecordsRoot = "/data/records/";
 volatile std::sig_atomic_t gStopRequested = 0;
+
+std::string executablePath(const char* argv0)
+{
+    char path[PATH_MAX + 1] = {};
+    const ssize_t length = ::readlink("/proc/self/exe", path, PATH_MAX);
+    if (length > 0) {
+        path[length] = '\0';
+        return path;
+    }
+    return argv0 ? std::string(argv0) : std::string();
+}
 
 void signalHandler(int) { gStopRequested = 1; }
 void writeProtocolLine(const std::string& line)
@@ -563,9 +575,9 @@ void drawHud(cv::Mat& frame,
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf(
-            "Usage: %s <model.rknn> [camera_device] [thread_num]\n"
+            "Usage: %s <model.rknn> [camera_device] [thread_num] [threshold_config]\n"
             "Example:\n"
-            "  %s model/RK3588/best_yolov8_fp16.rknn /dev/video41 12\n",
+            "  %s model/RK3588/best_yolov8_fp16.rknn /dev/video41 12 detection_thresholds.ini\n",
             argv[0], argv[0]);
         return EXIT_FAILURE;
     }
@@ -581,6 +593,26 @@ int main(int argc, char** argv) {
         thread_num = kDefaultThreadNum;
     }
 
+    const std::string threshold_config_path =
+        (argc >= 5)
+        ? std::string(argv[4])
+        : defaultThresholdConfigPath(executablePath(argv[0]));
+    const ThresholdConfigLoadResult threshold_config =
+        loadDetectionThresholds(threshold_config_path);
+    for (const std::string& warning : threshold_config.warnings) {
+        std::fprintf(stderr, "Threshold config warning: %s\n", warning.c_str());
+    }
+    std::fprintf(stderr, "Threshold config: %s\n", threshold_config_path.c_str());
+    for (int class_id = 0; class_id < kDetectionClassCount; ++class_id) {
+        std::fprintf(
+            stderr,
+            "  %s=%.3f\n",
+            detectionClassName(class_id),
+            threshold_config.thresholds.forClass(class_id));
+    }
+    const std::shared_ptr<const DetectionThresholds> confidence_thresholds =
+        std::make_shared<const DetectionThresholds>(threshold_config.thresholds);
+
     gst_init(&argc, &argv);
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
@@ -595,7 +627,13 @@ int main(int argc, char** argv) {
     }
 
     rknnPool<rkYolov5s, cv::Mat, InferenceResult> test_pool(
-        const_cast<char*>(model_name), thread_num);
+        const_cast<char*>(model_name),
+        thread_num,
+        [confidence_thresholds](const std::string& model_path) {
+            return std::make_shared<rkYolov5s>(
+                model_path,
+                confidence_thresholds);
+        });
 
     if (test_pool.init() != 0) {
         writeProtocolLine(makeErrorStatus("model_init_failed", "rknnPool init failed"));

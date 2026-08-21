@@ -8,7 +8,6 @@
 #define OBJ_NUMB_MAX_SIZE     128
 #define OBJ_CLASS_NUM         1          // ← 你的类别数（本例 ball/human/rim = 3）
 #define NMS_THRESH            0.45f
-#define BOX_THRESH            0.25f
 #define DFL_LEN               16         // 64 / 4，YOLOv8 固定
 #define LABEL_NALE_TXT_PATH   "./model/labels_list.txt"  // ← 你的标签文件
 

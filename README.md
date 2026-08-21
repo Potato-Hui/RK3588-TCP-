@@ -77,6 +77,7 @@ chmod +x build-linux_RK3588.sh
 ```text
 install/rknn_yolov5_demo_Linux/
 ├── rknn_yolov8_demo
+├── detection_thresholds.ini
 ├── lib/
 └── model/
 ```
@@ -87,7 +88,7 @@ RKNN、RGA 动态库或模型文件。
 ## 命令行参数
 
 ```text
-rknn_yolov8_demo <model.rknn> [camera_device] [thread_num]
+rknn_yolov8_demo <model.rknn> [camera_device] [thread_num] [threshold_config]
 ```
 
 参数说明：
@@ -97,9 +98,42 @@ rknn_yolov8_demo <model.rknn> [camera_device] [thread_num]
 | `model.rknn` | 是 | YOLOv8-Seg RKNN 模型路径 |
 | `camera_device` | 否 | 摄像头设备，默认 `/dev/video41` |
 | `thread_num` | 否 | RKNN 推理实例数量，当前代码默认 12 |
+| `threshold_config` | 否 | 类别阈值配置；默认读取可执行文件旁的 `detection_thresholds.ini` |
 
 更换模型时，新模型必须保持与当前模型相同的 YOLOv8-Seg 输入、输出张量
 结构。仅文件路径不同的兼容模型不需要修改后处理代码。
+
+## 每类别置信度阈值
+
+`detection_thresholds.ini` 为每个类别提供独立置信度阈值：
+
+```ini
+[ConfidenceThresholds]
+insulator=0.25
+crack=0.50
+pollution=0.50
+flashover=0.50
+broken=0.50
+```
+
+类别编号依次为 `insulator=0`、`crack=1`、`pollution=2`、
+`flashover=3`、`broken=4`。候选结果的置信度大于或等于对应阈值时才会
+保留；低于阈值时不会画框、生成掩码或写入拍照记录的 `metadata.json`。
+
+不传 `threshold_config` 时，程序稳定地从自身可执行文件所在目录读取配置。
+显式传入相对路径时，相对当前工作目录解析。配置文件缺失、配置项缺失或数值
+不在 `0.0` 到 `1.0` 范围内时，程序使用内置默认值并向标准错误输出警告。
+修改配置后重启程序即可生效，不需要重新编译。
+
+指定其他配置文件的示例：
+
+```bash
+./rknn_yolov8_demo \
+    model/RK3588/fixed_single.rknn \
+    /dev/video41 \
+    1 \
+    config/my_thresholds.ini
+```
 
 ## 首次运行：必须先使用单线程
 
@@ -167,6 +201,7 @@ model=model/RK3588/fixed_single.rknn
 ├── InsulatorMonitorSingle
 ├── single_model.ini
 ├── rknn_yolov8_demo
+├── detection_thresholds.ini
 ├── lib/
 └── model/
     └── RK3588/

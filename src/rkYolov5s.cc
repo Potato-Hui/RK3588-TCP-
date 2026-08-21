@@ -97,10 +97,21 @@ static int saveFloat(const char *file_name, float *output, int element_size)
 }
 
 rkYolov5s::rkYolov5s(const std::string &model_path)
+    : rkYolov5s(
+          model_path,
+          std::make_shared<const DetectionThresholds>())
+{
+}
+
+rkYolov5s::rkYolov5s(
+    const std::string& model_path,
+    std::shared_ptr<const DetectionThresholds> confidence_thresholds)
 {
     this->model_path = model_path;
-    nms_threshold = NMS_THRESH;      // 默认的NMS阈值
-    box_conf_threshold = BOX_THRESH; // 默认的置信度阈值
+    nms_threshold = NMS_THRESH; // 默认的NMS阈值
+    this->confidence_thresholds = confidence_thresholds
+        ? confidence_thresholds
+        : std::make_shared<const DetectionThresholds>();
 }
 
 int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
@@ -630,7 +641,10 @@ InferenceResult rkYolov5s::infer(cv::Mat &orig_img)
         }
 
         if (best_class_id < 0 ||
-            best_confidence < box_conf_threshold)
+            !passesConfidenceThreshold(
+                best_class_id,
+                best_confidence,
+                *confidence_thresholds))
         {
             continue;
         }

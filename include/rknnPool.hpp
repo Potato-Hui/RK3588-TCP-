@@ -7,14 +7,20 @@
 #include <mutex>
 #include <queue>
 #include <memory>
+#include <functional>
+#include <utility>
 
 // rknnModel模型类, inputType模型输入类型, outputType模型输出类型
 template <typename rknnModel, typename inputType, typename outputType>
 class rknnPool
 {
 private:
+    using ModelFactory =
+        std::function<std::shared_ptr<rknnModel>(const std::string&)>;
+
     int threadNum;
     std::string modelPath;
+    ModelFactory modelFactory;
 
     long long id;
     std::mutex idMtx, queueMtx;
@@ -27,6 +33,9 @@ protected:
 
 public:
     rknnPool(const std::string modelPath, int threadNum);
+    rknnPool(const std::string modelPath,
+             int threadNum,
+             ModelFactory modelFactory);
     int init();
     // 模型推理/Model inference
     int put(inputType inputData);
@@ -37,9 +46,24 @@ public:
 
 template <typename rknnModel, typename inputType, typename outputType>
 rknnPool<rknnModel, inputType, outputType>::rknnPool(const std::string modelPath, int threadNum)
+    : rknnPool(
+          modelPath,
+          threadNum,
+          [](const std::string& path) {
+              return std::make_shared<rknnModel>(path.c_str());
+          })
+{
+}
+
+template <typename rknnModel, typename inputType, typename outputType>
+rknnPool<rknnModel, inputType, outputType>::rknnPool(
+    const std::string modelPath,
+    int threadNum,
+    ModelFactory modelFactory)
 {
     this->modelPath = modelPath;
     this->threadNum = threadNum;
+    this->modelFactory = std::move(modelFactory);
     this->id = 0;
 }
 
@@ -50,7 +74,7 @@ int rknnPool<rknnModel, inputType, outputType>::init()
     {
         this->pool = std::make_unique<dpool::ThreadPool>(this->threadNum);
         for (int i = 0; i < this->threadNum; i++)
-            models.push_back(std::make_shared<rknnModel>(this->modelPath.c_str()));
+            models.push_back(this->modelFactory(this->modelPath));
     }
     catch (const std::bad_alloc &e)
     {
@@ -101,7 +125,7 @@ rknnPool<rknnModel, inputType, outputType>::~rknnPool()
 {
     while (!futs.empty())
     {
-        outputType temp = futs.front().get();
+        (void)futs.front().get();
         futs.pop();
     }
 }

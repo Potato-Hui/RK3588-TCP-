@@ -103,6 +103,7 @@ endforeach()
 # ---------------------------------------------------------
 add_executable(rknn_yolov5_demo
     src/main.cc
+    src/detection_thresholds.cpp
     src/postprocess.cc
     src/preprocess.cc
     src/rkYolov5s.cc
@@ -122,6 +123,21 @@ if(BUILD_TESTING)
         target_compile_options(${test_name}_test PRIVATE -Wall -Wextra)
         add_test(NAME ${test_name}_test COMMAND ${test_name}_test)
     endforeach()
+
+    add_executable(detection_thresholds_test
+        tests/detection_thresholds_test.cpp
+        src/detection_thresholds.cpp)
+    target_include_directories(detection_thresholds_test PRIVATE
+        "${CMAKE_SOURCE_DIR}/include")
+    target_compile_options(detection_thresholds_test PRIVATE -Wall -Wextra)
+    add_test(NAME detection_thresholds_test COMMAND detection_thresholds_test)
+
+    add_executable(rknn_pool_factory_test tests/rknn_pool_factory_test.cpp)
+    target_include_directories(rknn_pool_factory_test PRIVATE
+        "${CMAKE_SOURCE_DIR}/include")
+    target_compile_options(rknn_pool_factory_test PRIVATE -Wall -Wextra)
+    target_link_libraries(rknn_pool_factory_test PRIVATE pthread)
+    add_test(NAME rknn_pool_factory_test COMMAND rknn_pool_factory_test)
 endif()
 
 target_include_directories(rknn_yolov5_demo PRIVATE
@@ -181,6 +197,7 @@ target_link_options(rknn_yolov5_demo PRIVATE
 # 安装
 # ---------------------------------------------------------
 install(TARGETS rknn_yolov5_demo DESTINATION .)
+install(FILES "${CMAKE_SOURCE_DIR}/detection_thresholds.ini" DESTINATION .)
 install(PROGRAMS "${RKNN_RT_LIB}" DESTINATION lib)
 install(PROGRAMS "${RGA_LIB}" DESTINATION lib)
 
